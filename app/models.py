@@ -31,6 +31,11 @@ class Contact(Base):
 
     notes: Mapped[str | None] = mapped_column(Text)
 
+    # Base64 data URL (`data:image/png;base64,...`). Text because an encoded image
+    # overflows any varchar cap; the size limit is enforced in the schema layer so
+    # an oversized upload comes back as a 422 rather than a database error.
+    photo: Mapped[str | None] = mapped_column(Text)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, server_default=func.now(), nullable=False
     )
