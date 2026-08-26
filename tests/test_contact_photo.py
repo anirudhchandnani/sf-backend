@@ -308,6 +308,45 @@ def test_photo_endpoint_sets_a_validator_and_cache_policy(client, payload):
     assert "private" in headers["cache-control"]
 
 
+def test_photo_endpoint_returns_304_when_the_etag_matches(client, payload):
+    """An advertised ETag that is never compared is decorative."""
+    created = _create(client, payload, photo=data_url("image/png"))
+    etag = client.get(f"{BASE}/{created['id']}/photo").headers["etag"]
+
+    revalidated = client.get(f"{BASE}/{created['id']}/photo", headers={"If-None-Match": etag})
+
+    assert revalidated.status_code == 304
+    assert revalidated.content == b""
+
+
+def test_photo_endpoint_handles_a_weak_etag_and_a_list(client, payload):
+    created = _create(client, payload, photo=data_url("image/png"))
+    etag = client.get(f"{BASE}/{created['id']}/photo").headers["etag"]
+
+    header = f'"something-else", W/{etag}'
+    assert client.get(f"{BASE}/{created['id']}/photo", headers={"If-None-Match": header}).status_code == 304
+
+
+def test_photo_endpoint_sends_the_body_when_the_etag_differs(client, payload):
+    created = _create(client, payload, photo=data_url("image/png"))
+
+    response = client.get(f"{BASE}/{created['id']}/photo", headers={"If-None-Match": '"stale"'})
+
+    assert response.status_code == 200
+    assert response.content
+
+
+def test_editing_the_photo_changes_the_etag(client, payload):
+    """Otherwise a stale image would be served after an edit."""
+    created = _create(client, payload, photo=data_url("image/png", padding=8))
+    first = client.get(f"{BASE}/{created['id']}/photo").headers["etag"]
+
+    client.patch(f"{BASE}/{created['id']}", json={"photo": data_url("image/png", padding=64)})
+    second = client.get(f"{BASE}/{created['id']}/photo").headers["etag"]
+
+    assert first != second
+
+
 def test_photo_endpoint_404s_when_the_contact_has_no_photo(client, payload):
     created = _create(client, payload)
 

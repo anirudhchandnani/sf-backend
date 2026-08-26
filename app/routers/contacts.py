@@ -1,6 +1,6 @@
 import hashlib
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response, status
 from sqlalchemy.orm import Session
 
 from app import crud
@@ -31,6 +31,21 @@ EMAIL_CONFLICT = {
     "description": "Another contact already uses that email address.",
     "content": {"application/json": {"example": {"detail": "Email ada@example.com is already in use"}}},
 }
+
+
+def _etag_matches(header: str | None, etag: str) -> bool:
+    """
+    Whether an `If-None-Match` header covers `etag`.
+
+    The header is a comma-separated list and may use the `W/` weak prefix, so a
+    plain equality check against the raw string misses real matches.
+    """
+    if not header:
+        return False
+    if header.strip() == "*":
+        return True
+    candidates = (candidate.strip() for candidate in header.split(","))
+    return any(candidate.removeprefix("W/") == etag for candidate in candidates)
 
 
 def _get_or_404(db: Session, contact_id: int) -> Contact:
@@ -130,13 +145,20 @@ def list_contacts(
         },
     },
 )
-def get_contact_photo(contact_id: int = CONTACT_ID, db: Session = Depends(get_db)) -> Response:
+def get_contact_photo(
+    request: Request,
+    contact_id: int = CONTACT_ID,
+    db: Session = Depends(get_db),
+) -> Response:
     """
     Serve a contact's photo as a real image response.
 
     Kept off the list payload deliberately: a page of contacts with base64 images
-    inlined grows without bound. Here the bytes are decoded once, sent with their
-    real content type, and given a strong ETag so repeat views cost a 304.
+    inlined grows without bound. Here the bytes are decoded once and sent with
+    their real content type.
+
+    The ETag is honoured, not just advertised — a client that sends the tag back
+    gets a bodyless 304, so revisiting a list of avatars re-transfers nothing.
     """
     contact = _get_or_404(db, contact_id)
     if not contact.photo:
@@ -145,16 +167,17 @@ def get_contact_photo(contact_id: int = CONTACT_ID, db: Session = Depends(get_db
     media_type, data = decode_photo(contact.photo)
     etag = f'"{hashlib.sha256(data).hexdigest()[:32]}"'
 
+    # Private: a contact photo is not shared-cacheable. must-revalidate keeps an
+    # edited photo from being served stale.
+    cache_headers = {"ETag": etag, "Cache-Control": "private, max-age=0, must-revalidate"}
+
+    if _etag_matches(request.headers.get("if-none-match"), etag):
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=cache_headers)
+
     return Response(
         content=data,
         media_type=media_type,
-        headers={
-            "ETag": etag,
-            # Private: a contact photo is not shared-cacheable. must-revalidate
-            # keeps an edited photo from being served stale.
-            "Cache-Control": "private, max-age=0, must-revalidate",
-            "Content-Length": str(len(data)),
-        },
+        headers={**cache_headers, "Content-Length": str(len(data))},
     )
 
 
