@@ -1,3 +1,5 @@
+import hashlib
+
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Response, status
 from sqlalchemy.orm import Session
 
@@ -6,11 +8,13 @@ from app.database import get_db
 from app.models import Contact
 from app.schemas import (
     ContactCreate,
+    ContactListItem,
     ContactPage,
     ContactRead,
     ContactReplace,
     ContactUpdate,
     ErrorResponse,
+    decode_photo,
 )
 
 router = APIRouter(prefix="/api/v1/contacts", tags=["contacts"])
@@ -101,10 +105,56 @@ def list_contacts(
         db, search=search, limit=limit, offset=offset, sort_by=sort_by, order=order
     )
     return ContactPage(
-        items=[ContactRead.model_validate(item) for item in items],
+        # ContactListItem drops the base64 photo and reports `has_photo` instead;
+        # the image is served separately from /{contact_id}/photo.
+        items=[ContactListItem.model_validate(item) for item in items],
         total=total,
         limit=limit,
         offset=offset,
+    )
+
+
+@router.get(
+    "/{contact_id}/photo",
+    operation_id="getContactPhoto",
+    summary="Get a contact's photo",
+    response_class=Response,
+    responses={
+        200: {
+            "description": "The decoded image.",
+            "content": {"image/png": {}, "image/jpeg": {}, "image/gif": {}, "image/webp": {}},
+        },
+        404: {
+            "model": ErrorResponse,
+            "description": "No such contact, or the contact has no photo.",
+        },
+    },
+)
+def get_contact_photo(contact_id: int = CONTACT_ID, db: Session = Depends(get_db)) -> Response:
+    """
+    Serve a contact's photo as a real image response.
+
+    Kept off the list payload deliberately: a page of contacts with base64 images
+    inlined grows without bound. Here the bytes are decoded once, sent with their
+    real content type, and given a strong ETag so repeat views cost a 304.
+    """
+    contact = _get_or_404(db, contact_id)
+    if not contact.photo:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Contact {contact_id} has no photo")
+
+    media_type, data = decode_photo(contact.photo)
+    etag = f'"{hashlib.sha256(data).hexdigest()[:32]}"'
+
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={
+            "ETag": etag,
+            # Private: a contact photo is not shared-cacheable. must-revalidate
+            # keeps an edited photo from being served stale.
+            "Cache-Control": "private, max-age=0, must-revalidate",
+            "Content-Length": str(len(data)),
+        },
     )
 
 

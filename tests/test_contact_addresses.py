@@ -3,6 +3,7 @@ from sqlalchemy import inspect, select, text
 
 from app.database import SessionLocal, engine
 from app.models import Address, Contact
+from app.schemas import MAX_ADDRESSES_PER_CONTACT
 
 BASE = "/api/v1/contacts"
 
@@ -226,6 +227,138 @@ def test_the_orm_relationship_navigates_both_ways(client, payload):
         assert len(contact.addresses) == 1
         # back_populates: the child knows its parent too
         assert contact.addresses[0].contact.id == contact.id
+
+
+# --------------------------------------------------------------------------
+# Bounds and content rules
+# --------------------------------------------------------------------------
+
+
+def test_rejects_more_addresses_than_the_cap(client, payload):
+    """Without a cap, one request could write an unbounded number of rows."""
+    too_many = [{"type": "Home", "city": f"c{i}"} for i in range(MAX_ADDRESSES_PER_CONTACT + 1)]
+
+    response = client.post(BASE, json={**payload, "addresses": too_many})
+
+    assert response.status_code == 422
+
+
+def test_accepts_exactly_the_cap(client, payload):
+    at_cap = [{"type": "Home", "city": f"c{i}"} for i in range(MAX_ADDRESSES_PER_CONTACT)]
+
+    response = client.post(BASE, json={**payload, "addresses": at_cap})
+
+    assert response.status_code == 201, response.text
+    assert len(response.json()["addresses"]) == MAX_ADDRESSES_PER_CONTACT
+
+
+def test_rejects_an_address_with_no_content(client, payload):
+    """A type alone is not an address; it renders as an empty dash on the page."""
+    response = client.post(BASE, json={**payload, "addresses": [{"type": "Home"}]})
+
+    assert response.status_code == 422
+
+
+def test_rejects_an_address_that_is_only_whitespace(client, payload):
+    response = client.post(BASE, json={**payload, "addresses": [{"type": "Home", "city": "   "}]})
+
+    assert response.status_code == 422
+
+
+def test_one_filled_part_is_enough(client, payload):
+    response = client.post(BASE, json={**payload, "addresses": [{"type": "Home", "country": "UK"}]})
+
+    assert response.status_code == 201, response.text
+
+
+def test_rejects_duplicate_addresses(client, payload):
+    response = client.post(BASE, json={**payload, "addresses": [HOME, HOME]})
+
+    assert response.status_code == 422
+
+
+def test_duplicate_detection_ignores_case_and_padding(client, payload):
+    near = {**HOME, "city": "  LONDON  "}
+
+    response = client.post(BASE, json={**payload, "addresses": [HOME, near]})
+
+    assert response.status_code == 422
+
+
+def test_same_street_under_different_types_is_not_a_duplicate(client, payload):
+    """Working from home is legitimate: same address, two labels."""
+    response = client.post(BASE, json={**payload, "addresses": [HOME, {**HOME, "type": "Work"}]})
+
+    assert response.status_code == 201, response.text
+
+
+# --------------------------------------------------------------------------
+# Reconcile: ids must survive an edit that did not touch the addresses
+# --------------------------------------------------------------------------
+
+
+def test_renaming_a_contact_keeps_its_address_ids(client, payload):
+    """
+    Rebuilding the list wholesale gave every address a new id on every save.
+    Rows are reconciled in place now, so an unrelated edit touches none of them.
+    """
+    created = _create(client, payload, addresses=[HOME, WORK])
+    before = [address["id"] for address in created["addresses"]]
+
+    response = client.put(
+        f"{BASE}/{created['id']}",
+        json={**payload, "first_name": "Augusta", "addresses": [HOME, WORK]},
+    )
+
+    assert [address["id"] for address in response.json()["addresses"]] == before
+
+
+def test_editing_one_address_keeps_the_others_ids(client, payload):
+    created = _create(client, payload, addresses=[HOME, WORK])
+    before = [address["id"] for address in created["addresses"]]
+
+    response = client.put(
+        f"{BASE}/{created['id']}",
+        json={**payload, "addresses": [HOME, {**WORK, "city": "Oakland"}]},
+    )
+
+    after = response.json()["addresses"]
+    assert [address["id"] for address in after] == before
+    assert after[1]["city"] == "Oakland"
+
+
+def test_appending_an_address_leaves_existing_ids_alone(client, payload):
+    created = _create(client, payload, addresses=[HOME])
+    first_id = created["addresses"][0]["id"]
+
+    response = client.put(f"{BASE}/{created['id']}", json={**payload, "addresses": [HOME, WORK]})
+
+    after = response.json()["addresses"]
+    assert after[0]["id"] == first_id
+    assert len(after) == 2
+
+
+def test_removing_an_address_leaves_no_orphans(client, payload):
+    created = _create(client, payload, addresses=[HOME, WORK, OTHER])
+
+    client.put(f"{BASE}/{created['id']}", json={**payload, "addresses": [HOME]})
+
+    with SessionLocal() as db:
+        rows = db.execute(select(Address).where(Address.contact_id == created["id"])).scalars().all()
+        assert len(rows) == 1
+
+
+def test_patch_with_an_explicit_null_clears_the_addresses(client, payload):
+    """
+    Consistent with `photo: null`. Omitting the key still leaves them alone —
+    presence of the key is what distinguishes the two.
+    """
+    created = _create(client, payload, addresses=[HOME, WORK])
+
+    response = client.patch(f"{BASE}/{created['id']}", json={"addresses": None})
+
+    assert response.status_code == 200
+    assert response.json()["addresses"] == []
 
 
 def test_openapi_advertises_the_nested_addresses(client):

@@ -3,7 +3,15 @@ import binascii
 import re
 from datetime import datetime, timezone
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, computed_field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
 from app.models import AddressType
 
@@ -16,6 +24,25 @@ ALLOWED_PHOTO_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/
 MAX_PHOTO_BYTES = 2 * 1024 * 1024
 
 _DATA_URL_RE = re.compile(r"data:([\w/+.-]+);base64,(.+)", re.DOTALL)
+
+
+def _sniff_image_type(data: bytes) -> str | None:
+    """
+    Identify an image from its leading bytes.
+
+    The declared MIME in a data URL is caller-supplied and worth nothing on its
+    own — without this, any payload can be stored as `image/png` and the UI is
+    left rendering a broken image.
+    """
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        return "image/gif"
+    if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
 
 _PHOTO_DESCRIPTION = (
     "Profile picture as a base64 data URL, e.g. `data:image/png;base64,iVBOR...`. "
@@ -51,6 +78,12 @@ def _validate_photo(value: str | None) -> str | None:
     if len(decoded) > MAX_PHOTO_BYTES:
         raise ValueError(f"photo is {len(decoded)} bytes decoded, over the {MAX_PHOTO_BYTES} byte limit")
 
+    sniffed = _sniff_image_type(decoded)
+    if sniffed is None:
+        raise ValueError("photo does not contain a recognisable PNG, JPEG, GIF, or WebP image")
+    if sniffed != mime:
+        raise ValueError(f"photo is declared {mime!r} but its bytes are {sniffed!r}")
+
     return value
 
 
@@ -74,8 +107,61 @@ class AddressBase(BaseModel):
     country: str | None = Field(default=None, max_length=120, description="Country name.", examples=["USA"])
 
 
+def decode_photo(value: str) -> tuple[str, bytes]:
+    """
+    Split a stored photo back into (media type, raw bytes).
+
+    Safe to assume well-formed: nothing reaches the database without passing
+    `_validate_photo` first.
+    """
+    match = _DATA_URL_RE.fullmatch(value)
+    if match is None:  # pragma: no cover - unreachable for validated data
+        raise ValueError("stored photo is not a data URL")
+    return match.group(1), base64.b64decode(match.group(2), validate=True)
+
+
+#: Upper bound on addresses per contact. Without one, a single request can write
+#: an unbounded number of rows and the detail page renders every one of them.
+MAX_ADDRESSES_PER_CONTACT = 20
+
+_ADDRESS_PARTS = ("street", "city", "state", "postal_code", "country")
+
+
 class AddressCreate(AddressBase):
     """One address in a contact create or replace payload."""
+
+    @model_validator(mode="after")
+    def _reject_blank_address(self) -> "AddressCreate":
+        if not any((getattr(self, part) or "").strip() for part in _ADDRESS_PARTS):
+            raise ValueError("an address needs at least one of street, city, state, postal code, or country")
+        return self
+
+
+def _address_identity(address: AddressBase) -> tuple:
+    """Case-insensitive comparison key, used to reject exact duplicates."""
+    return (address.type, *((getattr(address, part) or "").strip().casefold() for part in _ADDRESS_PARTS))
+
+
+def _validate_address_list(addresses: list) -> list:
+    """
+    Bound the list and reject duplicates. Shared by create, replace, and update.
+
+    Takes any `AddressBase`, because `ContactRead` narrows the same field to
+    `AddressRead` and inherits this validator.
+    """
+    if len(addresses) > MAX_ADDRESSES_PER_CONTACT:
+        raise ValueError(
+            f"a contact may have at most {MAX_ADDRESSES_PER_CONTACT} addresses, got {len(addresses)}"
+        )
+
+    seen: set[tuple] = set()
+    for index, address in enumerate(addresses):
+        identity = _address_identity(address)
+        if identity in seen:
+            raise ValueError(f"address {index + 1} duplicates an earlier address")
+        seen.add(identity)
+
+    return addresses
 
 
 class AddressRead(AddressBase):
@@ -136,8 +222,10 @@ class ContactBase(BaseModel):
     photo: str | None = Field(default=None, description=_PHOTO_DESCRIPTION, examples=[_PHOTO_EXAMPLE])
     addresses: list[AddressCreate] = Field(
         default_factory=list,
+        max_length=MAX_ADDRESSES_PER_CONTACT,
         description=(
             "All addresses for this contact, each labelled Home, Work, or Other. "
+            f"At most {MAX_ADDRESSES_PER_CONTACT}, and no two may be identical. "
             "On PUT this replaces the whole set: addresses you omit are deleted."
         ),
     )
@@ -146,6 +234,11 @@ class ContactBase(BaseModel):
     @classmethod
     def _check_photo(cls, value: str | None) -> str | None:
         return _validate_photo(value)
+
+    @field_validator("addresses")
+    @classmethod
+    def _check_addresses(cls, value: list[AddressCreate]) -> list[AddressCreate]:
+        return _validate_address_list(value)
 
 
 _FULL_EXAMPLE = {
@@ -220,7 +313,11 @@ class ContactUpdate(BaseModel):
     notes: str | None = Field(default=None, description="New notes; replaces the existing text.")
     addresses: list[AddressCreate] | None = Field(
         default=None,
-        description="Replaces the whole address set. Omit to leave the existing addresses alone.",
+        max_length=MAX_ADDRESSES_PER_CONTACT,
+        description=(
+            "Replaces the whole address set. Omit the key to leave the existing "
+            "addresses alone; send null or [] to clear them."
+        ),
     )
     photo: str | None = Field(default=None, description=f"New photo. {_PHOTO_DESCRIPTION}")
 
@@ -228,6 +325,11 @@ class ContactUpdate(BaseModel):
     @classmethod
     def _check_photo(cls, value: str | None) -> str | None:
         return _validate_photo(value)
+
+    @field_validator("addresses")
+    @classmethod
+    def _check_addresses(cls, value: list[AddressCreate] | None) -> list[AddressCreate] | None:
+        return None if value is None else _validate_address_list(value)
 
 
 class ContactRead(ContactBase):
@@ -276,10 +378,34 @@ class ContactRead(ContactBase):
         return f"{self.first_name} {self.last_name}".strip()
 
 
+class ContactListItem(ContactRead):
+    """
+    A contact as it appears in a list.
+
+    Identical to `ContactRead` except that `photo` is replaced by `has_photo`.
+    Inlining base64 images in a collection makes the response grow without bound
+    — a page of 200 contacts with 2 MB photos is a ~500 MB payload, to render
+    avatars a few dozen pixels wide. Fetch the image itself from
+    `GET /api/v1/contacts/{id}/photo`, which is separately cacheable.
+    """
+
+    photo: str | None = Field(default=None, exclude=True)
+
+    @computed_field(
+        description="Whether this contact has a photo. Fetch it from /contacts/{id}/photo.",
+        examples=[True],
+    )
+    @property
+    def has_photo(self) -> bool:
+        return self.photo is not None
+
+
 class ContactPage(BaseModel):
     """One page of contacts plus the totals a client needs to paginate."""
 
-    items: list[ContactRead] = Field(description="Contacts on this page, ordered by the requested sort.")
+    items: list[ContactListItem] = Field(
+        description="Contacts on this page, ordered by the requested sort. Photos are not inlined."
+    )
     total: int = Field(
         description="Total contacts matching the query, ignoring `limit` and `offset`.",
         examples=[42],

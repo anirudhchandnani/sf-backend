@@ -64,6 +64,32 @@ def _build_addresses(rows: list[dict] | None) -> list[Address]:
     return [Address(**row) for row in rows or []]
 
 
+def _reconcile_addresses(contact: Contact, rows: list[dict]) -> None:
+    """
+    Update the contact's addresses in place to match `rows`.
+
+    Reassigning a fresh list would be simpler, but delete-orphan would then drop
+    every existing row and insert replacements — so a change that touched no
+    address at all (renaming the contact) still rewrote each one and handed it a
+    new id. Existing rows are reused positionally instead: only genuine additions
+    insert, only genuine removals delete, and an unchanged address keeps its id.
+    """
+    existing = list(contact.addresses)
+
+    for address, data in zip(existing, rows):
+        for field, value in data.items():
+            if getattr(address, field) != value:
+                setattr(address, field, value)
+
+    # Trim rows the payload no longer has; delete-orphan removes them on flush.
+    for address in existing[len(rows) :]:
+        contact.addresses.remove(address)
+
+    # Append the ones beyond what already existed.
+    for data in rows[len(existing) :]:
+        contact.addresses.append(Address(**data))
+
+
 def create_contact(db: Session, payload: ContactCreate) -> Contact:
     data = payload.model_dump()
     # addresses is a list of dicts; Contact(**data) would hand the relationship
@@ -82,14 +108,12 @@ def create_contact(db: Session, payload: ContactCreate) -> Contact:
 
 def replace_contact(db: Session, contact: Contact, payload: ContactReplace) -> Contact:
     data = payload.model_dump()
-    addresses = data.pop("addresses", None)
+    addresses = data.pop("addresses", None) or []
 
     for field, value in data.items():
         setattr(contact, field, _normalize_email(value) if field == "email" else value)
 
-    # Assigning a fresh list lets delete-orphan drop the rows that are gone.
-    # Mutating in place would leave the removed addresses behind.
-    contact.addresses = _build_addresses(addresses)
+    _reconcile_addresses(contact, addresses)
 
     db.commit()
     db.refresh(contact)
@@ -98,15 +122,18 @@ def replace_contact(db: Session, contact: Contact, payload: ContactReplace) -> C
 
 def update_contact(db: Session, contact: Contact, payload: ContactUpdate) -> Contact:
     data = payload.model_dump(exclude_unset=True)
-    # Only replace the address set when the caller actually sent one — PATCH
-    # leaves anything it did not mention untouched.
-    addresses = data.pop("addresses", None)
+
+    # Presence of the key is what matters, not its value: omitting `addresses`
+    # leaves the set alone, while an explicit null or [] clears it — matching
+    # how an explicit `photo: null` clears the photo.
+    replace_addresses = "addresses" in data
+    addresses = data.pop("addresses", None) or []
 
     for field, value in data.items():
         setattr(contact, field, _normalize_email(value) if field == "email" else value)
 
-    if addresses is not None:
-        contact.addresses = _build_addresses(addresses)
+    if replace_addresses:
+        _reconcile_addresses(contact, addresses)
 
     db.commit()
     db.refresh(contact)
