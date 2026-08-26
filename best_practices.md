@@ -82,12 +82,17 @@ Example code after:
 photo: Mapped[str | None] = mapped_column(Text)
 ```
 
-## Validate data-URL images on the schema, with a MIME allow-list and a decoded size cap
+## Validate data-URL images against their content, not their declared type
 
 Accepting arbitrary strings into an image field lets a caller store megabytes of junk or a
-`data:text/html` payload that a browser may later render. Validate the prefix against an
-allow-list and bound the *decoded* size — base64 inflates by roughly a third, so the
-encoded length is not the number you want to limit on.
+`data:text/html` payload that a browser may later render. Three checks, all necessary:
+
+1. The declared MIME against an allow-list.
+2. The *decoded* size — base64 inflates by roughly a third, so the encoded length is not the
+   number to limit on.
+3. **The leading bytes against that declared type.** A data URL's MIME is caller-supplied and
+   worth nothing on its own; without a magic-byte check any payload can be stored as
+   `image/png`, and the UI is left rendering a broken image.
 
 Example code before:
 
@@ -101,6 +106,19 @@ Example code after:
 ```python
 ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 MAX_PHOTO_BYTES = 2 * 1024 * 1024
+
+
+def _sniff_image_type(data: bytes) -> str | None:
+    """Identify an image from its leading bytes."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        return "image/gif"
+    if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
 
 
 class ContactBase(BaseModel):
@@ -123,7 +141,68 @@ class ContactBase(BaseModel):
             raise ValueError("photo is not valid base64") from exc
         if len(decoded) > MAX_PHOTO_BYTES:
             raise ValueError("photo exceeds the 2 MB limit")
+
+        sniffed = _sniff_image_type(decoded)
+        if sniffed is None:
+            raise ValueError("photo does not contain a recognisable image")
+        if sniffed != mime:
+            raise ValueError(f"photo is declared {mime!r} but its bytes are {sniffed!r}")
         return value
+```
+
+## Never inline a large field in a collection response
+
+A field that is bounded per record is still unbounded per page. A 2 MB base64 image is
+acceptable on one contact and catastrophic on a page of two hundred — the response grows to
+hundreds of megabytes to render avatars a few dozen pixels wide. Give the list a lightweight
+flag and serve the payload from its own cacheable endpoint.
+
+Example code before:
+
+```python
+class ContactPage(BaseModel):
+    items: list[ContactRead]  # every photo inlined, unbounded page size
+```
+
+Example code after:
+
+```python
+class ContactListItem(ContactRead):
+    """Like ContactRead, but the photo is a flag rather than the bytes."""
+
+    photo: str | None = Field(default=None, exclude=True)
+
+    @computed_field
+    @property
+    def has_photo(self) -> bool:
+        return self.photo is not None
+
+
+class ContactPage(BaseModel):
+    items: list[ContactListItem]
+```
+
+## Bound every collection a client can submit
+
+A nested list with no `max_length` lets one request write an unbounded number of rows, and the
+UI then renders every one of them. Cap it in the schema, where the error is a 422 rather than a
+timeout.
+
+Example code before:
+
+```python
+addresses: list[AddressCreate] = Field(default_factory=list)
+```
+
+Example code after:
+
+```python
+MAX_ADDRESSES_PER_CONTACT = 20
+
+addresses: list[AddressCreate] = Field(
+    default_factory=list,
+    max_length=MAX_ADDRESSES_PER_CONTACT,
+)
 ```
 
 ## Keep full-replace (PUT) schemas complete and partial-update (PATCH) schemas optional
@@ -191,22 +270,14 @@ def create_contact(db: Session, payload: ContactCreate) -> Contact:
     return contact
 ```
 
-## Replace child collections wholesale on PUT, honouring delete-orphan
+## Reconcile child collections in place; do not rebuild them on every save
 
-A full replace must reconcile children too. Assigning a fresh list lets `delete-orphan` remove
-the rows that are gone; mutating in place or appending leaves stale rows behind.
+A full replace must reconcile children too, but assigning a fresh list makes
+`delete-orphan` drop every existing row and insert replacements — so an edit that touched no
+child at all still rewrites each one and hands it a new primary key. Update the rows that
+survive, delete only what the payload dropped, and insert only what is new.
 
 Example code before:
-
-```python
-def replace_contact(db: Session, contact: Contact, payload: ContactReplace) -> Contact:
-    for field, value in payload.model_dump().items():
-        setattr(contact, field, value)
-    db.commit()
-    return contact
-```
-
-Example code after:
 
 ```python
 def replace_contact(db: Session, contact: Contact, payload: ContactReplace) -> Contact:
@@ -214,10 +285,51 @@ def replace_contact(db: Session, contact: Contact, payload: ContactReplace) -> C
     addresses = data.pop("addresses", None) or []
     for field, value in data.items():
         setattr(contact, field, value)
+    # Rewrites every row: renaming the contact churns all its address ids.
     contact.addresses = [Address(**address) for address in addresses]
     db.commit()
-    db.refresh(contact)
     return contact
+```
+
+Example code after:
+
+```python
+def _reconcile_addresses(contact: Contact, rows: list[dict]) -> None:
+    existing = list(contact.addresses)
+
+    for address, data in zip(existing, rows):
+        for field, value in data.items():
+            if getattr(address, field) != value:
+                setattr(address, field, value)
+
+    for address in existing[len(rows):]:
+        contact.addresses.remove(address)  # delete-orphan removes it on flush
+
+    for data in rows[len(existing):]:
+        contact.addresses.append(Address(**data))
+```
+
+## Distinguish an absent key from a null value on PATCH
+
+`model_dump(exclude_unset=True)` reports which keys the caller actually sent. For a collection,
+omitting the key means "leave it alone" while an explicit `null` means "clear it" — testing the
+*value* for None collapses those two into one and silently ignores a deliberate clear.
+
+Example code before:
+
+```python
+addresses = data.pop("addresses", None)
+if addresses is not None:          # an explicit null is silently ignored
+    contact.addresses = ...
+```
+
+Example code after:
+
+```python
+replace_addresses = "addresses" in data     # presence, not truthiness
+addresses = data.pop("addresses", None) or []
+if replace_addresses:
+    _reconcile_addresses(contact, addresses)
 ```
 
 ## Cover the destructive paths in tests, not just the happy path
