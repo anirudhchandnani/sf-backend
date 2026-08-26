@@ -177,3 +177,5 @@ app/
   routers/contacts.py REST endpoints
 tests/                API tests via FastAPI TestClient
 ```
+
+<!-- Qodo smoke test: verifying the GitHub App reviews PRs on this fork. -->
