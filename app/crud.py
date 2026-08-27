@@ -1,7 +1,7 @@
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from app.models import Address, Contact
+from app.models import Address, Contact, _utcnow
 from app.schemas import ContactCreate, ContactReplace, ContactUpdate
 
 SORTABLE_FIELDS = ("id", "first_name", "last_name", "email", "company", "created_at", "updated_at")
@@ -64,7 +64,7 @@ def _build_addresses(rows: list[dict] | None) -> list[Address]:
     return [Address(**row) for row in rows or []]
 
 
-def _reconcile_addresses(contact: Contact, rows: list[dict]) -> None:
+def _reconcile_addresses(contact: Contact, rows: list[dict]) -> bool:
     """
     Update the contact's addresses in place to match `rows`.
 
@@ -73,21 +73,44 @@ def _reconcile_addresses(contact: Contact, rows: list[dict]) -> None:
     address at all (renaming the contact) still rewrote each one and handed it a
     new id. Existing rows are reused positionally instead: only genuine additions
     insert, only genuine removals delete, and an unchanged address keeps its id.
+
+    Returns whether anything actually changed, so the caller can decide whether
+    the contact itself counts as modified.
     """
     existing = list(contact.addresses)
+    changed = False
 
     for address, data in zip(existing, rows):
         for field, value in data.items():
             if getattr(address, field) != value:
                 setattr(address, field, value)
+                changed = True
 
     # Trim rows the payload no longer has; delete-orphan removes them on flush.
     for address in existing[len(rows) :]:
         contact.addresses.remove(address)
+        changed = True
 
     # Append the ones beyond what already existed.
     for data in rows[len(existing) :]:
         contact.addresses.append(Address(**data))
+        changed = True
+
+    return changed
+
+
+def _touch(contact: Contact, addresses_changed: bool) -> None:
+    """
+    Bump `updated_at` when a child row changed.
+
+    `onupdate` only fires when the contacts row itself is UPDATEd, and neither
+    editing an address in place nor adding or removing one does that — so a
+    change that touched only addresses left the contact reporting its previous
+    modification time. Setting it explicitly is safe either way: when a scalar
+    field also changed, `onupdate` writes an equivalent value.
+    """
+    if addresses_changed:
+        contact.updated_at = _utcnow()
 
 
 def create_contact(db: Session, payload: ContactCreate) -> Contact:
@@ -113,7 +136,7 @@ def replace_contact(db: Session, contact: Contact, payload: ContactReplace) -> C
     for field, value in data.items():
         setattr(contact, field, _normalize_email(value) if field == "email" else value)
 
-    _reconcile_addresses(contact, addresses)
+    _touch(contact, _reconcile_addresses(contact, addresses))
 
     db.commit()
     db.refresh(contact)
@@ -133,7 +156,7 @@ def update_contact(db: Session, contact: Contact, payload: ContactUpdate) -> Con
         setattr(contact, field, _normalize_email(value) if field == "email" else value)
 
     if replace_addresses:
-        _reconcile_addresses(contact, addresses)
+        _touch(contact, _reconcile_addresses(contact, addresses))
 
     db.commit()
     db.refresh(contact)

@@ -1,3 +1,5 @@
+import time
+
 import pytest
 from sqlalchemy import inspect, select, text
 
@@ -359,6 +361,64 @@ def test_patch_with_an_explicit_null_clears_the_addresses(client, payload):
 
     assert response.status_code == 200
     assert response.json()["addresses"] == []
+
+
+def test_editing_only_an_address_bumps_the_contact_timestamp(client, payload):
+    """
+    `onupdate` fires on an UPDATE of the contacts row. Mutating a child in place
+    does not touch that row, so a PATCH carrying only addresses used to leave
+    the contact reporting its previous modification time.
+    """
+    created = _create(client, payload, addresses=[HOME])
+    before = created["updated_at"]
+    # Clock resolution, not behaviour: without a tick the create and the patch
+    # can land on the same microsecond and the comparison proves nothing.
+    time.sleep(0.01)
+
+    response = client.patch(
+        f"{BASE}/{created['id']}",
+        json={"addresses": [{**HOME, "city": "Bath"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["updated_at"] > before
+
+
+def test_adding_an_address_bumps_the_contact_timestamp(client, payload):
+    created = _create(client, payload, addresses=[HOME])
+    before = created["updated_at"]
+    # Clock resolution, not behaviour: without a tick the create and the patch
+    # can land on the same microsecond and the comparison proves nothing.
+    time.sleep(0.01)
+
+    response = client.patch(f"{BASE}/{created['id']}", json={"addresses": [HOME, WORK]})
+
+    assert response.json()["updated_at"] > before
+
+
+def test_removing_an_address_bumps_the_contact_timestamp(client, payload):
+    created = _create(client, payload, addresses=[HOME, WORK])
+    before = created["updated_at"]
+    # Clock resolution, not behaviour: without a tick the create and the patch
+    # can land on the same microsecond and the comparison proves nothing.
+    time.sleep(0.01)
+
+    response = client.patch(f"{BASE}/{created['id']}", json={"addresses": [HOME]})
+
+    assert response.json()["updated_at"] > before
+
+
+def test_a_no_op_address_patch_leaves_the_timestamp_alone(client, payload):
+    """Sending the same addresses back is not a modification."""
+    created = _create(client, payload, addresses=[HOME])
+    before = created["updated_at"]
+    # Clock resolution, not behaviour: without a tick the create and the patch
+    # can land on the same microsecond and the comparison proves nothing.
+    time.sleep(0.01)
+
+    response = client.patch(f"{BASE}/{created['id']}", json={"addresses": [HOME]})
+
+    assert response.json()["updated_at"] == before
 
 
 def test_openapi_advertises_the_nested_addresses(client):
