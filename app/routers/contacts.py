@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, Path, Query, Response, status
+import hashlib
+
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response, status
 from sqlalchemy.orm import Session
 
 from app import crud
@@ -6,11 +8,13 @@ from app.database import get_db
 from app.models import Contact
 from app.schemas import (
     ContactCreate,
+    ContactListItem,
     ContactPage,
     ContactRead,
     ContactReplace,
     ContactUpdate,
     ErrorResponse,
+    decode_photo,
 )
 
 router = APIRouter(prefix="/api/v1/contacts", tags=["contacts"])
@@ -27,6 +31,21 @@ EMAIL_CONFLICT = {
     "description": "Another contact already uses that email address.",
     "content": {"application/json": {"example": {"detail": "Email ada@example.com is already in use"}}},
 }
+
+
+def _etag_matches(header: str | None, etag: str) -> bool:
+    """
+    Whether an `If-None-Match` header covers `etag`.
+
+    The header is a comma-separated list and may use the `W/` weak prefix, so a
+    plain equality check against the raw string misses real matches.
+    """
+    if not header:
+        return False
+    if header.strip() == "*":
+        return True
+    candidates = (candidate.strip() for candidate in header.split(","))
+    return any(candidate.removeprefix("W/") == etag for candidate in candidates)
 
 
 def _get_or_404(db: Session, contact_id: int) -> Contact:
@@ -101,10 +120,64 @@ def list_contacts(
         db, search=search, limit=limit, offset=offset, sort_by=sort_by, order=order
     )
     return ContactPage(
-        items=[ContactRead.model_validate(item) for item in items],
+        # ContactListItem drops the base64 photo and reports `has_photo` instead;
+        # the image is served separately from /{contact_id}/photo.
+        items=[ContactListItem.model_validate(item) for item in items],
         total=total,
         limit=limit,
         offset=offset,
+    )
+
+
+@router.get(
+    "/{contact_id}/photo",
+    operation_id="getContactPhoto",
+    summary="Get a contact's photo",
+    response_class=Response,
+    responses={
+        200: {
+            "description": "The decoded image.",
+            "content": {"image/png": {}, "image/jpeg": {}, "image/gif": {}, "image/webp": {}},
+        },
+        404: {
+            "model": ErrorResponse,
+            "description": "No such contact, or the contact has no photo.",
+        },
+    },
+)
+def get_contact_photo(
+    request: Request,
+    contact_id: int = CONTACT_ID,
+    db: Session = Depends(get_db),
+) -> Response:
+    """
+    Serve a contact's photo as a real image response.
+
+    Kept off the list payload deliberately: a page of contacts with base64 images
+    inlined grows without bound. Here the bytes are decoded once and sent with
+    their real content type.
+
+    The ETag is honoured, not just advertised — a client that sends the tag back
+    gets a bodyless 304, so revisiting a list of avatars re-transfers nothing.
+    """
+    contact = _get_or_404(db, contact_id)
+    if not contact.photo:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Contact {contact_id} has no photo")
+
+    media_type, data = decode_photo(contact.photo)
+    etag = f'"{hashlib.sha256(data).hexdigest()[:32]}"'
+
+    # Private: a contact photo is not shared-cacheable. must-revalidate keeps an
+    # edited photo from being served stale.
+    cache_headers = {"ETag": etag, "Cache-Control": "private, max-age=0, must-revalidate"}
+
+    if _etag_matches(request.headers.get("if-none-match"), etag):
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=cache_headers)
+
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={**cache_headers, "Content-Length": str(len(data))},
     )
 
 
